@@ -4,7 +4,7 @@ pyxbackup
 Summary
 =======
 
-This backup script is somewhat a rewrite of https://github.com/dotmanila/mootools/blob/master/xbackup.sh.
+This backup script is a MariaDB version of pyxbackup by dotmanila, which is somewhat a rewrite of https://github.com/dotmanila/mootools/blob/master/xbackup.sh.
 
 Features
 ========
@@ -21,19 +21,19 @@ Dependencies
 
 The script is initially tested only with Python 2.6 on CentOS 6.5 and Python 2.7 on Ubuntu 14.04 - running it on newer versions i.e. 3.x may lead to incompatibility issues. Will appreciate pointers/pull requests on making it compatible with Python 3.x!
 
-Also it requires that the xtrabackup binaries i.e. innobackupex, xtrabackup*, xbstream are found in your PATH environment.
+Also it requires that the mariabackup binaries, i.e. mariabackup, xbstream are found in your PATH environment.
 
 Configuration
 =============
 
-A file called ``pyxbackup.cnf`` can store configuration values. By default, the script looks for this file from ``/etc/pyxbackup.cnf`` first, if not found, on the same directory where the script is installed. It can also be specified from a manual location with the ``--config`` CLI option. Some configuration options are exclusive to the command line, they are marked with ``(cli)`` when executing ``pyxbackup.py --help``.
+A file called ``pymbackup.cnf`` can store configuration values. By default, the script looks for this file from ``/etc/pymbackup.cnf`` first, if not found, on the same directory where the script is installed. It can also be specified from a manual location with the ``--config`` CLI option. Some configuration options are exclusive to the command line, they are marked with ``(cli)`` when executing ``pymbackup.py --help``.
 
-You can also use multiple configuration sections akin to MySQL's popular ``--defaults-group`` option in your ``pyxbackup.cnf``.
+You can also use multiple configuration sections akin to MariaDB's popular ``--defaults-group`` option in your ``pymbackup.cnf``.
 
 Below are some valid options recognized from the configuration file:
 
-    [pyxbackup]
-    # MySQL credentials that can be used to the instance
+    [pymbackup]
+    # MariaDB credentials that can be used to the instance
     # being backed up, only user and pass are used at the 
     # time of this writing
     mysql_host = 127.0.0.1
@@ -139,7 +139,7 @@ Below are some valid options recognized from the configuration file:
     # the path to the pyxbackup script on the remote server and 
     # other config/options
     # file if they are not in default locations ($PATH and /etc/pyxbackup.cnf)
-    remote_script=/usr/local/bin/pyxbackup --config=/path/to/custom/pyxbackup.cnf
+    remote_script=/usr/local/bin/pymbackup --config=/path/to/custom/pymbackup.cnf
 
 
 Minimum Configuration
@@ -157,12 +157,12 @@ First, create your local backup folders and install a single dependency:
     mkdir /backups/folder/stor
     mkdir /backups/folder/work
     yum install MySQL-python # apt-get install python-mysqldb
-    wget https://raw.githubusercontent.com/dotmanila/pyxbackup/master/pyxbackup
-    chmod 0755 pyxbackup
+    wget https://raw.githubusercontent.com/ManjotS/pymbackup/master/pymbackup
+    chmod 0755 pymbackup
 
 Run you first backup!
 
-    ./pyxbackup full
+    ./pymbackup full
 
 See more `Configuration`_ options above.
 
@@ -201,7 +201,7 @@ When ``apply-log`` is not used, and ``compress_with=qpress``, this will be the f
     
     cat /path/to/backup.xbs.qp | xbstream -x -C /path/to/destination/folder
 
-    innobackupex --decompress /path/to/destination/folder
+    mariabackup --decompress /path/to/destination/folder
 
 
 Encrypted Backups (*.qp.xbcrypt)
@@ -225,7 +225,7 @@ Similar to the previous format, except this is streamed with xbstream i.e. ``app
         --input=/path/to/backup.qp.xbcrypt \
         | xbstream -x -C /path/to/destination/folder
 
-    innobackupex --decompress /path/to/destination/folder
+    mariabackup --decompress /path/to/destination/folder
 
 
 Binary Log Streaming
@@ -237,7 +237,7 @@ Binary log streaming requires that you configure the ``mysql_host``, ``mysql_use
 
 A simple invocation would look like:
 
-    pyxbackup binlog-stream
+    pymbackup binlog-stream
 
 In some cases, if you are backing up data from a slave but want to stream the binary logs from the master, the script needs to know this is what you want as the master and slave will have a different set of binary logs. For this, you can specify the option ``--binlog-from-master`` or set ``binlog_from_master=1`` on the configuration file.
 
@@ -250,7 +250,7 @@ Examples
 
 Assuming I have a very minimal ``pyxbackup.cnf`` below:
 
-    [pyxbackup]
+    [pymbackup]
     stor_dir = /sbx/msb/msb_5_6_190/bkp/stor
     work_dir = /sbx/msb/msb_5_6_190/bkp/work
     retention_sets = 2
@@ -260,35 +260,35 @@ Running a Full Backup
 
 Taking a full backup:
 
-    pyxbackup full
+    pymbackup full
 
 Running an Incremental Backup
 -----------------------------
 
 Taking an incremental backup:
 
-    pyxbackup incr
+    pymbackup incr
 
 Listing Existing Backups
 ------------------------
 
 Listing existing backups - also will help identify incomplete/failed backups that may be consuming disk space:
 
-    pyxbackup list
+    pymbackup list
 
 Checking Status of Last Backup
 ------------------------------
 
 Support for Zabbix/Nagios tests for monitoring:
 
-    pyxbackup --status-format=[nagios|zabbix] status
+    pymbackup --status-format=[nagios|zabbix] status
 
 Keeping a Running "prepared-full" Backup
 ----------------------------------------
 
 When enabled, a special folder inside the ``work_dir`` will be maintained. This is prefixed with **P_** and the timestamp will correspond to the last full backup that has been taken. When the full backup is taken, a ``--redo-only`` will be applied to it, any succeeding incrementals will be prepared to the same. When in need of a recent snapshot, this special folder can be a quick source.
 
-    pyxbackup --apply-log full
+    pymbackup --apply-log full
 
 One Touch Prepare of Specific Backup
 ------------------------------------
@@ -301,7 +301,7 @@ For example, I have these 2 backup sets with 2 incrementals each:
 
 If I want to prepare the backup ``2014_10_15-11_32_41`` and make it ready for use, I will use the following command:
 
-    pyxbackup --restore-backup=2014_10_15-11_32_41 \
+    pymbackup --restore-backup=2014_10_15-11_32_41 \
         --restore-dir=/sbx/msb/msb_5_6_190/bkp/tmp restore-set
 
 After this command, I will have a folder ``/sbx/msb/msb_5_6_190/bkp/tmp/P_2014_10_15-11_32_41`` ready for use i.e. to provision a slave or staging server.

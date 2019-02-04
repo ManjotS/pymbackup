@@ -2765,7 +2765,7 @@ Options here can also be specified on a filed called %s.cnf which will be
 checked in this order:
 
 - on a file specified via the --config option
-- /etc/pyxbackup.cnf
+- /etc/pymbackup.cnf
 - on the same directory of the script 
 
 Valid commands are:
@@ -3512,7 +3512,7 @@ class PyxOptions(object):
             "Options here can also be specified on a filed called %s.cnf \n"
             "which will be checked in this order: \n\n"
             "- on a file specified via the --config option\n"
-            "- /etc/pyxbackup.cnf\n"
+            "- /etc/pymbackup.cnf\n"
             "- on the same directory of the script \n\n"
             "Valid commands are:\n\n"
             "\tfull: Execute full backups\n"
