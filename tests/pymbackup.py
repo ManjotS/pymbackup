@@ -1,10 +1,12 @@
 #!/usr/bin/python
 
-# pyxbackup - Robust Xtrabackup based MySQL Backups Manager
+# pymbackup - Robust mariabackup based MySQL Backups Manager
+# Forked from pyxbackup by Jervin Real
 #
 # @author Jervin Real <jervin.real@percona.com>
+# @forker Manjot Singh <singh@mariadb.com>
 
-import sys, traceback, os, errno, signal
+import sys, traceback, os, errno, signal, socket
 import time, calendar, shutil, re, pwd
 import smtplib, MySQLdb, base64
 from datetime import datetime, timedelta
@@ -13,7 +15,7 @@ from optparse import OptionParser
 from subprocess import Popen, PIPE, STDOUT, CalledProcessError
 from struct import unpack
 
-XB_BIN_NAME = 'pyxbackup'
+XB_BIN_NAME = 'pymbackup'
 
 xb_opt_config = None
 xb_opt_config_section = None
@@ -23,7 +25,7 @@ xb_opt_mysql_user = None
 xb_opt_mysql_pass = None
 xb_opt_mysql_host = 'localhost'
 xb_opt_mysql_port = 3306
-xb_opt_mysql_sock = '/tmp/mysql.sock'
+xb_opt_mysql_sock = None
 xb_opt_mysql_cnf = None
 xb_opt_retention_binlogs = False
 xb_opt_compress = False
@@ -55,6 +57,7 @@ xb_opt_wipeout = False
 xb_opt_first_binlog = False
 xb_opt_binlog_binary = None
 xb_opt_binlog_from_master = False
+xb_opt_binlog_resume = 0
 xb_opt_encrypt = False
 xb_opt_encrypt_key_file = None
 xb_opt_extra_ibx_options = None
@@ -71,9 +74,10 @@ xb_stor_binlogs = None
 xb_curdate = None
 xb_cfg = None
 xb_cwd = None
-xb_version = 0.4
+xb_lang = None
+xb_version = 0.5
 xb_ibx_opts = ''
-xb_ibx_bin = 'innobackupex'
+xb_ibx_bin = 'mariabackup'
 xb_zip_bin = 'gzip'
 xb_xbs_bin = 'xbstream'
 xb_this_backup = None
@@ -89,8 +93,8 @@ xb_weekly_list = None
 xb_monthly_list = None
 xb_last_backup = None
 xb_last_backup_is = None
-xb_first_binlog = None
-xb_last_binlog = None
+xb_stor_start_binlog = None
+xb_stor_end_binlog = None
 xb_binlogs_list = None
 xb_binlog_name = None
 xb_exit_code = 0
@@ -124,8 +128,8 @@ XB_CKP_FILE = 'xtrabackup_checkpoints'
 XB_LOG_FILE = 'xtrabackup_logfile'
 XB_LCK_FILE = ''
 XB_META_FILE = 'backup.meta'
-XB_BKP_LOG = 'innobackupex-backup.log'
-XB_APPLY_LOG = 'innobackupex-prepare.log'
+XB_BKP_LOG = 'mariabackup.log'
+XB_APPLY_LOG = 'mariabackup-prepare.log'
 XB_LOG_NAME = XB_BIN_NAME + '.log'
 XB_SSH_TMPFILE = '/tmp/' + XB_BIN_NAME + '-ssh-result'
 XB_SIGTERM_CAUGHT = False
@@ -154,6 +158,18 @@ cmd_no_log = [
 cmd_no_lock = cmd_no_log
 cmd_backups = [XB_CMD_FULL, XB_CMD_INCR]
 
+class PyxLanguage(object):
+    dictionary = {
+        'rotate_to_monthly': "Rotating backup %s to monthly",
+        'binlog_start_from': "Maintaing binary logs from %s"
+    }
+
+    def __init__(self):
+        pass
+
+    def say(self, key, params=None):
+        return self.dictionary[key] % params
+
 def date(unixtime, format = '%m/%d/%Y %H:%M:%S'):
     d = datetime.fromtimestamp(unixtime)
     return d.strftime(format)
@@ -170,7 +186,7 @@ def _xb_version(verstr = None, tof = False):
             if tof: return float("%d.%d" % (XB_VERSION_MAJOR, XB_VERSION_MINOR))
             else: return True
 
-        p = Popen(["xtrabackup", "--version"], stdout=PIPE, stderr=PIPE)
+        p = Popen(["mariabackup", "--version"], stdout=PIPE, stderr=PIPE)
         
         # weird, xtrabackup outputs version 
         # string on STDERR instead of STDOUT
@@ -186,14 +202,14 @@ def _xb_version(verstr = None, tof = False):
 
         if XB_VERSION_MAJOR == 0:
             _error(
-                "Invalid xtrabackup version or unable to determine valid " 
+                "Invalid mariabackup version or unable to determine valid " 
                 "version string or binary version non-GA release")
             _error("Version string was \"%s\"" % err)
             _die("Exiting")
 
-        if XB_VERSION_MINOR >= 3: xb_ibx_bin = 'xtrabackup'
+        if XB_VERSION_MINOR >= 3: xb_ibx_bin = 'mariabackup'
 
-        _debug("Found xtrabackup version %d.%d.%d" % (
+        _debug("Found mariabackup version %d.%d.%d" % (
             XB_VERSION_MAJOR, XB_VERSION_MINOR, XB_VERSION_REV))
     else:
         major, minor, rev = verstr.split('.')
@@ -519,7 +535,7 @@ def _apply_log(bkp, incrdir=None, final=False):
         return True
 
     except Exception, e:
-        _error("Command was: ", ibx_cmd)
+        _error("Command was: ", ibx_cmd.replace(xb_opt_mysql_pass,"*******"))
         _error("Error: process exited with status %s" % str(e))
         _error("Please check innobackupex log file at %s" % ibx_log)
         _exit_code(XB_EXIT_APPLY_FAIL)
@@ -837,7 +853,7 @@ def _extract_xbcrypt(dest, meta = None):
 
     if _xb_version(tof = True) < 2.3:
         _say(
-            "You are running an older xtrabackup version "
+            "You are running an older mariabackup version "
             "that do not have --decrypt support, "
             "switching manual decompresssion")
         return _extract_xbcrypt_file(dest)
@@ -1100,13 +1116,13 @@ def _extract_ibx_decompress(dest, meta = None):
     if (XB_VERSION_MAJOR == 2 and XB_VERSION_MINOR == 1 and XB_VERSION_REV < 4) or \
         XB_VERSION_MAJOR < 2 or (XB_VERSION_MAJOR == 2 and XB_VERSION_MINOR <= 0):
         _say(
-            "You are running an older xtrabackup version "
+            "You are running an older mariabackup version "
             "that do not have --decompress support, "
             "switching manual decompresssion")
         return _extract_qp_decompress(dest)
 
     # Now we decompress *.qp files
-    if xb_ibx_bin == 'xtrabackup':
+    if xb_ibx_bin == 'mariabackup':
         ibx_cmd = xb_ibx_bin + ' --decompress --target-dir=%s' % dest
     else:
         ibx_cmd = xb_ibx_bin + ' --decompress %s' % dest
@@ -1147,9 +1163,9 @@ def _decompress(archive, dest, meta = None):
         return False
 
     if archive[-6:] == 'tar.gz':
-        return _extract_tgz(archive, dest, meta)
+        return _extract_tgz(archive, dest)
     elif archive[-6:] == 'xbs.gz':
-        return _extract_xgz(archive, dest, meta)
+        return _extract_xgz(archive, dest)
     elif archive[-6:]  == 'xbs.qp':
         return _extract_stream_qpress(archive, dest, meta)
     elif archive[-14:]  == 'xbs.qp.xbcrypt':
@@ -1255,10 +1271,10 @@ def _get_binlog_info_from_log(logfile):
 
     for l in lines:
         if 'MySQL binlog position' in l:
-            m = re.search('filename \'(.*)\',', l)
+            m = re.search('filename \'(.*)\', ', l)
         
         if 'MySQL slave binlog position' in l:
-            s = re.search('filename \'(.*)\'', l)
+            s = re.search('filename \'(.*)\', ', l)
 
     if m is not None:
         _say("Found binary log name from log %s" % m.group(1))
@@ -1288,6 +1304,13 @@ def _notify_by_email(subject, msg="", to=None):
         s = smtplib.SMTP('127.0.0.1')
         s.sendmail(fr, recpt.split(','), hdr + msg)
         s.quit()
+
+    except smtplib.SMTPServerDisconnected:
+        _warn("Disconnected from SMTP server, reconnecting")
+        s = smtplib.SMTP('127.0.0.1')
+        s.sendmail(fr, recpt.split(','), hdr + msg)
+        s.quit()
+        
     except Exception, e:
         if xb_opt_debug: traceback.print_exc()
         _die("Could not send mail ({0}): {1}".format(e.errno, e.strerror))
@@ -1350,7 +1373,7 @@ def _ssh_execute(cmd, out=False, nowait=False):
         return True
 
     except Exception, e:
-        _error("Command was: ", ssh_cmd)
+        _error("Command was: ", ssh_cmd.replace(xb_opt_mysql_pass,"*******"))
         _error("Error: process exited with status %s" % str(e))
         _exit_code(XB_EXIT_REMOTE_CMD_FAIL)
         raise
@@ -1370,42 +1393,84 @@ def _pre_run_xb():
 
         xb_last_backup, xb_last_backup_is, xb_last_full = t
 
-def _oldest_binlog_from_backup():
-    old_binlog = False
+def _binlog_from_backup(backup, full=None):
+    binlog = None
+
+    # Backward compatibility with 'xbackup.meta'
+    if full is None:
+        meta_file_dir = os.path.join(xb_stor_full, backup)
+    else:
+        meta_file_dir = os.path.join(xb_stor_incr, full, backup)
+
+    meta = _read_backup_metadata(meta_file_dir)
 
     if xb_opt_binlog_from_master:
         field_name = 'master_log_bin'
     else:
         field_name = 'log_bin'
 
+    try:
+        binlog = meta.get(XB_BIN_NAME, field_name)
+        _debug("Found binlog name from backup, %s" % binlog)
+
+        if binlog == 'None':
+            _warn("Invalid binlog record from backup, found '%s'" % binlog)
+            binlog = False
+    except NoOptionError, e:
+        _warn("No binlog information from specified backup!")
+
+    return binlog
+
+def _oldest_binlog_from_backup():
     if xb_full_list is None or len(xb_full_list) <= 0:
         return False
 
-    # Backward compatibility with 'xbackup.meta'
-    meta_file_dir = os.path.join(xb_stor_full, xb_full_list[-1:][0])
-    meta = _read_backup_metadata(meta_file_dir)
+    return _binlog_from_backup(xb_full_list[-1])
 
-    try:
-        old_binlog = meta.get(XB_BIN_NAME, field_name)
-        _debug("Found binlog from oldest full backup, %s" % old_binlog)
+def _newest_binlog_from_backup():
+    if xb_full_list is None or len(xb_full_list) <= 0:
+        return False
 
-        if old_binlog == 'None':
-            _warn("Invalid old binlog record from full backup, found '%s'" % old_binlog)
-            old_binlog = False
-    except NoOptionError, e:
-        _warn("No binlog information from oldest full backup!")
+    if xb_incr_list is not None and len(xb_incr_list) > 0:
+        backup = xb_incr_list.values()[len(xb_incr_list)-1][0]
+        return _binlog_from_backup(backup, xb_last_full)
+    else:
+        backup = xb_full_list[0]
+        return _binlog_from_backup(backup)
 
-    return old_binlog
-
-def _purge_binlogs_to(old_binlog):
+def _purge_binlogs():
     if xb_binlogs_list is None: return
 
-    if xb_opt_retention_binlogs is None:
+    binlog_names = []
+    has_gaps = None
+    index = None
+
+    for b in xb_binlogs_list:
+        if b[0:-7] not in binlog_names:
+            binlog_names.append(b[0:-7])
+        if not has_gaps:
+            if index is None:
+                index = int(b[-6:])
+            elif (index+1) < int(b[-6:]):
+                has_gaps = True
+            else: index = int(b[-6:])
+
+        #_debug("%d %d" % (index, int(b[-6:])))
+
+    if has_gaps:
+        _warn("Stored binary logs has gaps in index series, usability in PITR is at risk")
+
+    if len(binlog_names) > 1:
+        _warn("Stored binary logs has multiple name prefixes, we will not be able to purge!")
+
+    meta_start_binlog = _oldest_binlog_from_backup()
+
+    if not xb_opt_retention_binlogs and meta_start_binlog:
         for l in xb_binlogs_list:
-            if l < old_binlog:
+            if int(l[-6:]) < int(meta_start_binlog[-6:]):
                 _say("Deleting old binary log %s" % l)
                 os.remove(os.path.join(xb_stor_binlogs, l))
-    else:
+    elif xb_opt_retention_binlogs > 0:
         x = int(time.time())-(xb_opt_retention_binlogs*24*60*60)
         prev = None
         for l in xb_binlogs_list:
@@ -1428,6 +1493,117 @@ def _purge_binlogs_to(old_binlog):
                     _say("%s matches binary log retention period, stopping" % f)
                     break
             else: prev = f 
+
+def _stream_binlog_from():
+    global xb_stor_end_binlog
+    global xb_stor_start_binlog
+
+    def _missing_from_server(bname, bindex, start_from_name=None):
+        if start_from_name is not None:
+            _warn("%s was determined from backups/--first-binlog, but this file "
+                "does not exist on the server" % start_from_name)
+
+        _warn("There could be gaps between your backups and available binlogs") 
+        start_from_name = "%s.%06d" % (bname, bindex)
+
+        return bindex, start_from_name
+
+    start_from = None
+    start_from_name = None
+
+    # Determine oldest binlog from backups metadata
+    meta_start_binlog = _oldest_binlog_from_backup()
+    meta_end_binlog = _newest_binlog_from_backup()
+
+    # If this server has binary log information from backups
+    if meta_start_binlog and meta_end_binlog:
+        # If the oldest stored binlog is older than oldest backup
+        # we resume from the newest stored binlogs
+        if start_from < int(meta_start_binlog[-6:]):
+            # unless there are no existing stored binlogs
+            if xb_stor_end_binlog is not None:
+                start_from = int(xb_stor_end_binlog[-6:])
+            else:
+                start_from = int(meta_start_binlog[-6:])
+        # If the oldest stored binlog is newer than the oldest 
+        # binlog from backup, we should restart binlog stream based on
+        # oldest backup binlog info
+        elif start_from > int(meta_end_binlog[-6:]):
+            start_from = int(meta_start_binlog[-6:])
+
+    # An explicit first-binlog takes precedence
+    if xb_opt_first_binlog: 
+        start_from = int(xb_opt_first_binlog[-6:])
+        start_from_name = xb_opt_first_binlog
+        _say("First binlog has been manually specified, %s" % start_from_name)
+
+    if not db_connect():
+        _die("Failed to connect to remote host, ", 
+            "unable to check list of binary logs.")
+
+    cur = xb_mysqldb.cursor(MySQLdb.cursors.DictCursor)
+    cur.execute('SHOW BINARY LOGS')
+    logs = []
+    low = None
+    high = None
+
+    while True:
+        row = cur.fetchone()
+        if row is None: break
+        logs.append(row['Log_name'])
+        if low is None: low = row['Log_name']
+        high = row['Log_name']
+
+    db_close()
+
+    _debug("Oldest binlog from backup metadata: %s" % meta_start_binlog)
+    _debug("Newest stored binlog: %s" % xb_stor_end_binlog)
+    _debug("Oldest stored binlog: %s" % xb_stor_start_binlog)
+    _debug("Binlogs list from MySQL server: %s" % str(logs))
+
+    # Up to this point, start_from is an int, we rebuild it
+    # with the binlog prefix name based on what is seen on the server.
+    if start_from is not None:
+        start_from_name = "%s.%06d" % (high[0:-7], start_from)
+    else:
+        _warn("No binary log information is available from data backups")
+        # Used oldest stored binlog as based number
+        if xb_stor_start_binlog is not None and xb_opt_binlog_resume == 1:
+            _warn("Checking for existing binary log backups")
+            if low[0:-7] == xb_stor_end_binlog[0:-7] and start_from is None:
+                start_from = int(xb_stor_end_binlog[-6:])
+                start_from_name = xb_stor_end_binlog
+            else:
+                _warn("Existing binary log backups have different prefix name than source server")
+
+    # The binlog we are supposed to start from so far 
+    # should exist on the server's binary logs list.
+    if start_from < int(low[-6:]) or start_from is None:
+        if xb_opt_binlog_resume == 1:
+            start_from, start_from_name = _missing_from_server(low[0:-7], int(low[-6:]), start_from_name)
+            _warn("Streaming ALL from %s with --binlog-resume=1" % start_from_name)
+        else: start_from = None
+    elif start_from > int(high[-6:]):
+        if xb_opt_binlog_resume == 1:
+            start_from, start_from_name = _missing_from_server(high[0:-7], int(high[-6:]), start_from_name)
+            _warn("Streaming from last file %s from the server with --binlog-resume=1" % start_from_name)
+        else: start_from = None
+
+    if start_from is None:
+        if start_from_name is not None:
+            _die(
+                "Using %s as first binlog, but this file does not exist on the "
+                "server anymore. If you used --first-binlog, consider adding "
+                "--binlog-resume=1 to automatically identify possible start files." % start_from_name)   
+        else:
+            _die(
+                "Unable to determine automatically which binary log to start/resume from. "
+                "If there are no existing backups, you may need a new one otherwise use --first-binlog. "
+                "If you think binary logs may have been purged on the source, try --binlog-resume=1")   
+    
+    _say(xb_lang.say('binlog_start_from', start_from_name))
+
+    return start_from_name 
 
 def _purge_bitmaps_to(lsn):
     _say("Purging bitmap files to LSN: %s" % lsn)
@@ -1677,10 +1853,6 @@ def run_xb():
     if xb_last_full:
         xb_prepared_backup = "%s/P_%s" % (xb_opt_work_dir, xb_last_full)
 
-
-    if xb_opt_mysql_cnf:
-        xb_ibx_opts = ' --defaults-file=' + xb_opt_mysql_cnf + ' ' + xb_ibx_opts
-
     if XB_VERSION_MINOR >= 3:
         xb_ibx_opts = ' --backup' + xb_ibx_opts        
 
@@ -1696,6 +1868,9 @@ def run_xb():
 
     if xb_opt_mysql_sock:
         xb_ibx_opts = (' --socket=%s ' % xb_opt_mysql_sock) + xb_ibx_opts
+
+    if xb_opt_mysql_cnf:
+        xb_ibx_opts = ' --defaults-file=' + xb_opt_mysql_cnf + ' ' + xb_ibx_opts
 
     if xb_opt_remote_push_only \
             and not _ssh_execute("mkdir -p %s" % xb_this_backup_remote):
@@ -1818,7 +1993,7 @@ def run_xb():
                 p_ibx = Popen(run_cmd, shell=True, stderr=PIPE)
                 p_tee = Popen(tee_cmd, shell=True, stdin=p_ibx.stderr)
 
-        _say("Running xtrabackup with command: ", 
+        _say("Running mariabackup with command: ", 
             re.sub('\s--password=([^\s]+)', ' --password=*******', run_cmd))
 
         r = p_ibx.poll()
@@ -1837,7 +2012,7 @@ def run_xb():
         xb_info_bkp_end = date(time.time(), '%Y_%m_%d-%H_%M_%S')
 
     except Exception, e:
-        _error("Command was: ", run_cmd)
+        _error("Command was: ", run_cmd.replace(xb_opt_mysql_pass,"*******"))
         _error("Error: process exited with status %s" % str(e))
         _error("Please check innobackupex log file at %s" % ibx_log)
         _exit_code(XB_EXIT_INNOBACKUP_FAIL)
@@ -2280,63 +2455,17 @@ def run_xb_apply_last():
     _say("Apply-last-log completed OK")
 
 def run_binlog_stream():
-    global xb_last_binlog
-    global xb_first_binlog
+    start_from_name = _stream_binlog_from()
 
     if xb_opt_binlog_binary is not None:
         if not os.path.isfile(xb_opt_binlog_binary):
             _die("The specified mysqlbinlog binary",
                 "%s does not exist" % xb_opt_binlog_binary)
         else: mysqlbinlog = xb_opt_binlog_binary
-    else: mysqlbinlog = 'mysqlbinlog'
+    else: mysqlbinlog = _which('mysqlbinlog')
 
-
-    # Determine oldest binlog we should get based on xb_last_full log file
-    # Determine latest binlog we have
-    old_binlog = _oldest_binlog_from_backup()
-
-    if not xb_first_binlog and not old_binlog and not xb_opt_first_binlog:
-        _die("Cannot proceed, no binlog information from oldest backup nor ",
-            "there are any existing binlogs yet. Please try with --first-binlog ",
-            "option to specify the first binlog to start copying")
-
-    if not old_binlog: old_binlog = xb_first_binlog
-
-    # An explicit first-binlog takes precedence
-    if xb_opt_first_binlog: old_binlog = xb_opt_first_binlog
-
-    _say("Maintaing binary logs from %s" % old_binlog)
-
-    if not db_connect():
-        _die("Failed to connect to remote host, ", 
-            "unable to check list of binary logs.")
-
-    cur = xb_mysqldb.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute('SHOW BINARY LOGS')
-    logs = []
-    low = None
-    high = None
-
-    while True:
-        row = cur.fetchone()
-        if row is None: break
-        logs.append(row['Log_name'])
-        if low is None: low = row['Log_name']
-        high = row['Log_name']
-
-    db_close()
-    if xb_last_binlog is None: xb_last_binlog = old_binlog
-
-    _debug("old_binlog: %s, xb_last_binlog: %s, found_binlogs: %s" % (
-        old_binlog, xb_last_binlog, str(logs)))
-
-    if old_binlog not in logs and not int(old_binlog[-6:]) <= int(xb_last_binlog[-6:]):
-        _die("I cannot find our oldest binlog from the available binary logs ",
-            "on the server, aborting! Try again with --first-binlog")
-
-    if xb_last_binlog not in logs:
-        _die("I cannot find our newest binlog from the available binary logs ",
-            "on the server, aborting! Try again with --first-binlog")
+    if mysqlbinlog is None:
+        _die("mysqlbinlog binary does not exist")
 
     run_cmd_s = mysqlbinlog
 
@@ -2359,14 +2488,21 @@ def run_binlog_stream():
 
     run_failures = 0
     sleeps = 0
-    poll = 15
+    
+    # We monitor in loop activity more frequently when debugging
+    if xb_opt_debug:
+        poll = 1
+        sleeps_max = 10
+    else:
+        poll = 15
+        sleeps_max = 1800
 
     try:
         os.chdir(xb_stor_binlogs)
 
         while True:
             FNULL = None
-            run_cmd = ("%s %s" % (run_cmd_s, xb_last_binlog))
+            run_cmd = ("%s %s" % (run_cmd_s, start_from_name))
             _debug("Running mysqlbinlog with: %s" % run_cmd)
 
             if xb_opt_debug:
@@ -2385,15 +2521,11 @@ def run_binlog_stream():
                 time.sleep(poll)
                 sleeps += poll
 
-                if sleeps >= 1800:
+                if sleeps >= sleeps_max:
                     # We re-evaluate our oldest binlog to keep and purge older ones
                     list_backups()
-                    old_binlog = _oldest_binlog_from_backup()
-                    if not old_binlog: old_binlog = xb_first_binlog
-                    _purge_binlogs_to(old_binlog)
-                    _say("Maintaing binary logs from %s" % old_binlog)
+                    _purge_binlogs()
                     sleeps = 0
-
 
                 if XB_SIGTERM_CAUGHT:
                     p.kill()
@@ -2415,7 +2547,7 @@ def run_binlog_stream():
 
         os.chdir(xb_cwd)
     except Exception, e:
-        _error("Command was: ", run_cmd)
+        _error("Command was: ", run_cmd.replace(xb_opt_mysql_pass,"*******"))
         _error("Error: process exited with status %s" % str(e))
         _exit_code(XB_EXIT_BINLOG_STREAM_FAIL)
         raise
@@ -2607,6 +2739,7 @@ def init():
     global xb_opt_wipeout
     global xb_opt_first_binlog
     global xb_opt_binlog_from_master
+    global xb_opt_binlog_resume
     global xb_opt_binlog_binary
     global xb_opt_encrypt
     global xb_opt_encrypt_key_file
@@ -2625,7 +2758,7 @@ def init():
     _init_log_file("/tmp/%s-%s" % (xb_curdate, XB_LOG_NAME))
 
     p_usage = "Usage: %prog [options] COMMAND"
-    p_desc = "Managed xtrabackup based backups."
+    p_desc = "Managed mariabackup based backups."
     p_epilog = """
 
 Options here can also be specified on a filed called %s.cnf which will be 
@@ -2645,6 +2778,9 @@ Valid commands are:
     restore-set: Restore to a specific backup set
     last-lsn: Print out to_lsn value of last backup for incremental use
     wipeout: Cleanup all existing backups
+    prune: Prune backups manually based on configured retention sets
+    binlog-stream: When configured for binary log streaming, start the process
+    meta: Internal command only, when communicating with remote server
 
 """
     p_epilog = p_epilog % XB_BIN_NAME
@@ -2696,7 +2832,7 @@ Valid commands are:
     parser.add_option('-T', '--remote-host', dest='remote_host',
         help='Stream backups to this remote host')
     parser.add_option('-L', '--remote-push-only', dest='remote_push_only', action="store_true",
-        help=('Instructs xtrabackup that all backups will be pushed to '
+        help=('Instructs mariabackup that all backups will be pushed to '
             'remote only, no local post processing'))
     parser.add_option('-B', '--remote-script', dest='remote_script',
         help=('When --remote-push-only is enabled, we need to specify the '
@@ -2742,6 +2878,10 @@ Valid commands are:
         help=('For binlog-stream, when --slave-info is enabled on the backups '
             'and you want to stream binary logs from the master instead '
             'this tells the script to determine the correct binary log file name'))
+    parser.add_option('', '--binlog-resume', dest='binlog_resume', type="int",
+        help=('How binary log streaming will behave when interrupted and '
+            'sequence from the source server has been lost or altered.'),
+        default=0)
     parser.add_option('-l', '--binlog-binary', dest='binlog_binary', type="string",
         help=('For binlog-stream, specify where the 5.6+ mysqlbinlog utility '
             'is located'))
@@ -2843,6 +2983,12 @@ Valid commands are:
         if xb_cfg.has_option(xb_opt_config_section, 'binlog_from_master'):
             xb_opt_binlog_from_master = xb_cfg.get(xb_opt_config_section, 'binlog_from_master')
 
+        if xb_cfg.has_option(xb_opt_config_section, 'binlog_resume'):
+            xb_opt_binlog_resume = xb_cfg.get(xb_opt_config_section, 'binlog_resume')
+
+        if xb_cfg.has_option(xb_opt_config_section, 'first_binlog'):
+            xb_opt_first_binlog = xb_cfg.get(xb_opt_config_section, 'first_binlog')
+
         if xb_cfg.has_option(xb_opt_config_section, 'compress'):
             xb_opt_compress = bool(int(xb_cfg.get(xb_opt_config_section, 'compress')))
 
@@ -2901,6 +3047,8 @@ Valid commands are:
     if options.first_binlog: xb_opt_first_binlog = options.first_binlog
     if options.binlog_binary: xb_opt_binlog_binary = options.binlog_binary
     if options.binlog_from_master: xb_opt_binlog_from_master = options.binlog_from_master
+
+    xb_opt_binlog_resume = options.binlog_resume
 
     if options.remote_stor_dir: xb_opt_remote_stor_dir = options.remote_stor_dir
     if options.remote_host: xb_opt_remote_host = options.remote_host
@@ -2970,8 +3118,7 @@ Valid commands are:
             "uncompressed encrypted backup will be added in the future")
 
     if xb_opt_command in [XB_CMD_FULL, XB_CMD_INCR, XB_CMD_PREP, XB_CMD_APPL]:
-        _check_binary('innobackupex')
-        _check_binary('xtrabackup')
+        _check_binary('mariabackup')
 
     if xb_opt_remote_nc_port_min:
         _check_binary('nc')
@@ -2987,7 +3134,8 @@ Valid commands are:
         _check_binary('qpress')
 
     # store xtrabackup version numbers
-    _xb_version()
+    if xb_opt_command not in [XB_CMD_WIPE, XB_CMD_LIST]:
+        _xb_version()
 
     # we test email delivery beforehand to make sure it works
     # this will happen only once as long as the sentinel file exists
@@ -3177,8 +3325,8 @@ def list_backups():
             "filesystem to free up some disk space safely.")
 
 def list_binlogs():
-    global xb_first_binlog
-    global xb_last_binlog
+    global xb_stor_start_binlog
+    global xb_stor_end_binlog
     global xb_binlogs_list
     global xb_binlog_name
 
@@ -3196,10 +3344,11 @@ def list_binlogs():
             # sort of an optimization to skip opening each file
             # if you have thousands of binary logs
             if xb_binlog_name and xb_binlog_name == d[0:-7]:
-                _debug("%s matches binary log name, appending" % d)
+                #_debug("%s matches binary log name, appending" % d)
+                pass
             # we check the magic number for the binary log to validate
             elif open(f, 'rb').read(4) != '\xfebin':
-                _debug("%s is not a valid binary log, skipping" % d)
+                #_debug("%s is not a valid binary log, skipping" % d)
                 continue
             elif xb_binlog_name is None:
                 xb_binlog_name = d[0:-7]
@@ -3209,9 +3358,9 @@ def list_binlogs():
 
     if xb_binlogs_list is not None:
         xb_binlogs_list.sort()
-        _debug("Binary logs list: %s" % str(xb_binlogs_list))
-        xb_first_binlog = xb_binlogs_list[0]
-        xb_last_binlog = xb_binlogs_list[len(xb_binlogs_list)-1]
+        _debug("Stored binary logs: %s" % str(xb_binlogs_list))
+        xb_stor_start_binlog = xb_binlogs_list[0]
+        xb_stor_end_binlog = xb_binlogs_list[len(xb_binlogs_list)-1]
 
 # http://stackoverflow.com/questions/1857346/\
 # python-optparse-how-to-include-additional-info-in-usage-output
@@ -3222,9 +3371,12 @@ class PyxOptParser(OptionParser):
 if __name__ == "__main__":
     try:
         signal.signal(signal.SIGTERM, _sigterm_handler)
+        signal.signal(signal.SIGINT, _sigterm_handler)
+
+        xb_lang = PyxLanguage()
         xb_curdate = date(time.time(), '%Y_%m_%d-%H_%M_%S')
         xb_cwd = os.path.dirname(os.path.realpath(__file__))
-        xb_hostname = os.uname()[1]
+        xb_hostname = socket.getfqdn()
         xb_user = pwd.getpwuid(os.getuid())[0]
 
         dt = datetime.strptime(xb_curdate, '%Y_%m_%d-%H_%M_%S')
@@ -3270,8 +3422,6 @@ if __name__ == "__main__":
             run_wipeout()
         else: run_status()
 
-        _destroy_lock_file()
-
         if os.path.isfile(xb_log_file):
             if xb_opt_remote_host and xb_opt_command not in [XB_CMD_PREP, XB_CMD_APPL]:
                 _push_to_remote_scp(xb_log_file, "%s/" % xb_this_backup_remote.rstrip('/'))
@@ -3302,6 +3452,8 @@ if __name__ == "__main__":
             traceback.print_exc()
 
         sys.exit(255)
+    finally:
+        _destroy_lock_file()
 
 class PyxOptions(object):
     config = None
@@ -3312,7 +3464,7 @@ class PyxOptions(object):
     mysql_pass = None
     mysql_host = 'localhost'
     mysql_port = 3306
-    mysql_sock = '/tmp/mysql.sock'
+    mysql_sock = None
     mysql_cnf = None
     retention_binlogs = False
     compress = False
@@ -3344,6 +3496,7 @@ class PyxOptions(object):
     first_binlog = False
     binlog_binary = None
     binlog_from_master = False
+    binlog_resume = 0
     encrypt = False
     encrypt_key_file = None
     extra_ibx_options = None
@@ -3354,7 +3507,7 @@ class PyxOptions(object):
         _init_log_file("/tmp/%s-%s" % (xb_curdate, XB_LOG_NAME))
 
         p_usage = "Usage: %prog [options] COMMAND"
-        p_desc = "Managed xtrabackup based backups."
+        p_desc = "Managed mariabackup based backups."
         p_epilog = ["\n"
             "Options here can also be specified on a filed called %s.cnf \n"
             "which will be checked in this order: \n\n"
@@ -3369,7 +3522,10 @@ class PyxOptions(object):
             "\tapply-last: Prepare to the most recent backup\n"
             "\trestore-set: Restore to a specific backup set\n"
             "\tlast-lsn: Print out to_lsn value of last backup for incremental use\n"
-            "\twipeout: Cleanup all existing backups\n"]
+            "\twipeout: Cleanup all existing backups\n"
+            "\tprune: Prune backups manually based on configured retention sets\n"
+            "\tbinlog-stream: When configured for binary log streaming, start the process\n"
+            "\tmeta: Internal command only, when communicating with remote server\n"]
         p_epilog = p_epilog % XB_BIN_NAME
 
         parser = PyxOptParser(p_usage, version="%prog " + str(xb_version),
@@ -3419,7 +3575,7 @@ class PyxOptions(object):
         parser.add_option('-T', '--remote-host', dest='remote_host',
             help='Stream backups to this remote host')
         parser.add_option('-L', '--remote-push-only', dest='remote_push_only', action="store_true",
-            help=('Instructs xtrabackup that all backups will be pushed to '
+            help=('Instructs mariabackup that all backups will be pushed to '
                 'remote only, no local post processing'))
         parser.add_option('-B', '--remote-script', dest='remote_script',
             help=('When --remote-push-only is enabled, we need to specify the '
@@ -3465,6 +3621,10 @@ class PyxOptions(object):
             help=('For binlog-stream, when --slave-info is enabled on the backups '
                 'and you want to stream binary logs from the master instead '
                 'this tells the script to determine the correct binary log file name'))
+        parser.add_option('', '--binlog-resume', dest='binlog_resume', type="int",
+            help=('How binary log streaming will behave when interrupted and '
+                'sequence from the source server has been lost or altered.'),
+            default=0)
         parser.add_option('-l', '--binlog-binary', dest='binlog_binary', type="string",
             help=('For binlog-stream, specify where the 5.6+ mysqlbinlog utility '
                 'is located'))
@@ -3527,6 +3687,8 @@ class PyxOptions(object):
         if options.first_binlog: first_binlog = options.first_binlog
         if options.binlog_binary: binlog_binary = options.binlog_binary
         if options.binlog_from_master: binlog_from_master = options.binlog_from_master
+
+        binlog_resume = options.binlog_resume
 
         if options.remote_stor_dir: remote_stor_dir = options.remote_stor_dir
         if options.remote_host: remote_host = options.remote_host
@@ -3597,15 +3759,15 @@ class PyxOptions(object):
                 "uncompressed encrypted backup will be added in the future")
 
         if command in [XB_CMD_FULL, XB_CMD_INCR, XB_CMD_PREP, XB_CMD_APPL]:
-            _check_binary('innobackupex')
-            _check_binary('xtrabackup')
+            _check_binary('mariabackup')
 
         if remote_nc_port_min:
             _check_binary('nc')
             _check_binary('netstat')
 
         # store xtrabackup version numbers
-        _xb_version()
+        if command not in [XB_CMD_WIPE, XB_CMD_LIST]:
+            _xb_version()
 
         # we test email delivery beforehand to make sure it works
         # this will happen only once as long as the sentinel file exists
@@ -3691,6 +3853,12 @@ class PyxOptions(object):
 
         if cfg.has_option(config_section, 'binlog_from_master'):
             binlog_from_master = cfg.get(config_section, 'binlog_from_master')
+
+        if cfg.has_option(config_section, 'binlog_resume'):
+            binlog_resume = cfg.get(config_section, 'binlog_resume')
+
+        if cfg.has_option(config_section, 'first_binlog'):
+            first_binlog = cfg.get(config_section, 'first_binlog')
 
         if cfg.has_option(config_section, 'compress'):
             compress = bool(int(cfg.get(config_section, 'compress')))

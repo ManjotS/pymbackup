@@ -6,9 +6,9 @@ START_IP = 0
 Vagrant.configure("2") do |config|
   #config.ssh.insert_key = false
   config.ssh.pty = true
-  config.vm.box = "revin/pyxbackup"
+  config.vm.box = "revin/pymbackup"
   config.vm.synced_folder ".", "/vagrant", disabled: true
-  config.vm.synced_folder "../", "/usr/local/pyxbackup"
+  config.vm.synced_folder "../", "/usr/local/pymbackup"
   config.vm.provider "virtualbox" do |v|
     v.memory = 2048
     v.cpus = 4
@@ -31,7 +31,7 @@ Vagrant.configure("2") do |config|
     ansible.sudo = true
     #ansible.verbose = 'vvv'
     ansible.extra_vars = {
-      mysql_version: '5.7'
+      mysql_version: '5.6'
     }
   end
 end
