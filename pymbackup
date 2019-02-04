@@ -79,7 +79,7 @@ xb_version = 0.5
 xb_ibx_opts = ''
 xb_ibx_bin = 'mariabackup'
 xb_zip_bin = 'gzip'
-xb_xbs_bin = 'xbstream'
+xb_xbs_bin = 'mbstream'
 xb_this_backup = None
 xb_this_backup_remote = None
 xb_this_binlog = None
@@ -191,7 +191,7 @@ def _xb_version(verstr = None, tof = False):
         # weird, xtrabackup outputs version 
         # string on STDERR instead of STDOUT
         out, err = p.communicate()
-        ver = re.search('version ([\d\.]+)', err)
+        ver = re.search('server ([\d\.]+)', err)
         major, minor, rev = ver.group(1).split('.')
     
         XB_VERSION_MAJOR = int(major) if major else 0
@@ -299,7 +299,7 @@ def _read_magic_chunk(bfile, size):
     This is a more reliable way of reading some files format
 
     XBCRYP for xbcrypt files
-    XBSTCK for xbstream files
+    XBSTCK for mbstream files
     """
 
     if not os.path.isfile(bfile):
@@ -770,10 +770,10 @@ def _extract_xgz(xgz, dest):
     gz_cmd += " %s" % xgz
     FNULL = None
 
-    xbs_cmd = "xbstream -x -C %s" % dest
+    xbs_cmd = "mbstream -x -C %s" % dest
 
     _debug("Running gzip command: %s" % gz_cmd)
-    _debug("Running xbstream command: %s" % xbs_cmd)
+    _debug("Running mbstream command: %s" % xbs_cmd)
 
     if not os.path.isdir(dest): os.mkdir(dest, 0755)
 
@@ -807,12 +807,12 @@ def _extract_xgz(xgz, dest):
     return True
 
 def _extract_xbs(xbs, dest, meta = None):
-    xbs_cmd = "xbstream -x -C %s" % dest
+    xbs_cmd = "mbstream -x -C %s" % dest
     xbc_cmd = 'cat %s' % xbs
 
     if not os.path.isdir(dest): os.mkdir(dest, 0755)
 
-    _say("Extracting from xbstream format: %s" % xbs)
+    _say("Extracting from mbstream format: %s" % xbs)
     FNULL = None
 
     if not xb_opt_debug:
@@ -840,7 +840,7 @@ def _extract_xbs(xbs, dest, meta = None):
         _error("Extract command was: %s | %s" % (xbc_cmd, xbs_cmd))
         _error("Extract returned exit codes were: %s and %s" % (str(r), str(x)))
         _exit_code(XB_EXIT_EXTRACT_FAIL)
-        _die("Decompress of xbstream file %s failed." % xbs)
+        _die("Decompress of mbstream file %s failed." % xbs)
 
     return True
 
@@ -945,7 +945,7 @@ def _extract_stream_qpress(xbs, dest, meta = None):
     xbc_cmd = None
     is_encrypted = False
 
-    xbs_cmd = "xbstream -x -C %s" % dest
+    xbs_cmd = "mbstream -x -C %s" % dest
 
     if xbs[-14:] == 'xbs.qp.xbcrypt':
         if not xb_opt_encrypt:
@@ -969,7 +969,7 @@ def _extract_stream_qpress(xbs, dest, meta = None):
     FNULL = None
 
     _debug("Running xbcrypt command: %s" % xbc_cmd)
-    _debug("Running xbstream command: %s" % xbs_cmd)
+    _debug("Running mbstream command: %s" % xbs_cmd)
 
     if not os.path.isdir(dest): os.mkdir(dest, 0755)
 
@@ -1963,7 +1963,7 @@ def run_xb():
 
             p_cmp = Popen(pipe_cmd, stdin=p_ibx.stdout, shell=True)
         elif xb_opt_remote_push_only:
-            pipe_cmd = "xbstream -x -C %s" % xb_this_backup_remote
+            pipe_cmd = "mbstream -x -C %s" % xb_this_backup_remote
 
             # We open the netcat port before opening the innobackupex process
             if xb_opt_remote_nc_port_min:
@@ -3128,7 +3128,7 @@ Valid commands are:
         _check_binary('xbcrypt')
 
     if xb_opt_compress:
-        _check_binary('xbstream')
+        _check_binary('mbstream')
 
     if xb_opt_compress_with == 'qpress':
         _check_binary('qpress')
